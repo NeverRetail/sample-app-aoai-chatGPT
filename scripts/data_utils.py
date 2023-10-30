@@ -1,12 +1,14 @@
 """Data utilities for index preparation."""
 import ast
-from asyncio import sleep
 import html
 import json
 import os
 import re
 import requests
 import openai
+import re
+import tempfile
+import time
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -18,39 +20,48 @@ import tiktoken
 from azure.identity import DefaultAzureCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 from azure.core.credentials import AzureKeyCredential
+from azure.storage.blob import ContainerClient
 from bs4 import BeautifulSoup
-from langchain.text_splitter import TextSplitter, MarkdownTextSplitter, RecursiveCharacterTextSplitter, PythonCodeTextSplitter
+from langchain.text_splitter import (
+    TextSplitter,
+    MarkdownTextSplitter,
+    RecursiveCharacterTextSplitter,
+    PythonCodeTextSplitter,
+)
 from tqdm import tqdm
 from typing import Any
 
 
 FILE_FORMAT_DICT = {
-        "md": "markdown",
-        "txt": "text",
-        "html": "html",
-        "shtml": "html",
-        "htm": "html",
-        "py": "python",
-        "pdf": "pdf"
-    }
+    "md": "markdown",
+    "txt": "text",
+    "html": "html",
+    "shtml": "html",
+    "htm": "html",
+    "py": "python",
+    "pdf": "pdf",
+}
 
 RETRY_COUNT = 5
 
 SENTENCE_ENDINGS = [".", "!", "?"]
-WORDS_BREAKS = list(reversed([",", ";", ":", " ", "(", ")", "[", "]", "{", "}", "\t", "\n"]))
+WORDS_BREAKS = list(
+    reversed([",", ";", ":", " ", "(", ")", "[", "]", "{", "}", "\t", "\n"])
+)
 
-HTML_TABLE_TAGS = {"table_open": "<table>", "table_close": "</table>", "row_open":"<tr>"}
-
-PDF_HEADERS = {
-    "title": "h1",
-    "sectionHeading": "h2"
+HTML_TABLE_TAGS = {
+    "table_open": "<table>",
+    "table_close": "</table>",
+    "row_open": "<tr>",
 }
+
+PDF_HEADERS = {"title": "h1", "sectionHeading": "h2"}
+
 
 class TokenEstimator(object):
     GPT2_TOKENIZER = tiktoken.get_encoding("gpt2")
 
     def estimate_tokens(self, text: Union[str, List]) -> int:
-
         return len(self.GPT2_TOKENIZER.encode(text, allowed_special="all"))
 
     def construct_tokens_with_size(self, tokens: str, numofTokens: int) -> str:
@@ -59,67 +70,92 @@ class TokenEstimator(object):
         )
         return newTokens
 
+
 TOKEN_ESTIMATOR = TokenEstimator()
 
+
 class PdfTextSplitter(TextSplitter):
-    def __init__(self, length_function: Callable[[str], int] =TOKEN_ESTIMATOR.estimate_tokens, separator: str = "\n\n", **kwargs: Any):
+    def __init__(
+        self,
+        length_function: Callable[[str], int] = TOKEN_ESTIMATOR.estimate_tokens,
+        separator: str = "\n\n",
+        **kwargs: Any,
+    ):
         """Create a new TextSplitter for htmls from extracted pdfs."""
         super().__init__(**kwargs)
         self._table_tags = HTML_TABLE_TAGS
         self._separators = separator or ["\n\n", "\n", " ", ""]
         self._length_function = length_function
-        self._noise = 50 # tokens to accommodate differences in token calculation, we don't want the chunking-on-the-fly to inadvertently chunk anything due to token calc mismatch
+        self._noise = 50  # tokens to accommodate differences in token calculation, we don't want the chunking-on-the-fly to inadvertently chunk anything due to token calc mismatch
 
-    def extract_caption(self, s, type):
+    def extract_caption(self, text):
         separator = self._separators[-1]
         for _s in self._separators:
             if _s == "":
                 separator = _s
                 break
-            if _s in s:
+            if _s in text:
                 separator = _s
                 break
+
         # Now that we have the separator, split the text
         if separator:
-            lines = s.split(separator)
+            lines = text.split(separator)
         else:
-            lines = list(s)
+            lines = list(text)
 
+        # remove empty lines
+        lines = [line for line in lines if line != ""]
         caption = ""
-        if type == "prefix": #find the last heading and the last line before the table
-            if len(s.split(f"<{PDF_HEADERS['title']}>"))>1:
-               caption +=  s.split(f"<{PDF_HEADERS['title']}>")[-1].split(f"</{PDF_HEADERS['title']}>")[0]
-            if len(s.split(f"<{PDF_HEADERS['sectionHeading']}>"))>1:
-               caption +=  s.split(f"<{PDF_HEADERS['sectionHeading']}>")[-1].split(f"</{PDF_HEADERS['sectionHeading']}>")[0]
-            caption += "\n"+ lines[-1]
-        else: # find the first line after the table
-            caption += lines[0]
+
+        if len(text.split(f"<{PDF_HEADERS['title']}>")) > 1:
+            caption += text.split(f"<{PDF_HEADERS['title']}>")[-1].split(
+                f"</{PDF_HEADERS['title']}>"
+            )[0]
+        if len(text.split(f"<{PDF_HEADERS['sectionHeading']}>")) > 1:
+            caption += text.split(f"<{PDF_HEADERS['sectionHeading']}>")[-1].split(
+                f"</{PDF_HEADERS['sectionHeading']}>"
+            )[0]
+
+        caption += "\n" + lines[-1].strip()
+
         return caption
-    
+
     def split_text(self, text: str) -> List[str]:
         start_tag = self._table_tags["table_open"]
         end_tag = self._table_tags["table_close"]
         splits = text.split(start_tag)
-        
-        final_chunks = self.chunk_rest(splits[0]) # the first split is before the first table tag so it is regular text
 
-        table_caption_prefix = self.extract_caption(splits[0], "prefix")
+        final_chunks = self.chunk_rest(
+            splits[0]
+        )  # the first split is before the first table tag so it is regular text
+
+        table_caption_prefix = ""
+        if len(final_chunks) > 0:
+            table_caption_prefix += self.extract_caption(
+                final_chunks[-1]
+            )  # extracted from the last chunk before the table
         for part in splits[1:]:
             table, rest = part.split(end_tag)
-            table_caption_suffix = self.extract_caption(rest, "suffix")
-            table = start_tag + table + end_tag 
-            minitables = self.chunk_table(table, "\n".join([table_caption_prefix, table_caption_suffix]))
+            table = start_tag + table + end_tag
+            minitables = self.chunk_table(table, table_caption_prefix)
             final_chunks.extend(minitables)
 
-            if rest!="":
-                final_chunks.extend(self.chunk_rest(rest))
-            table_caption_prefix = self.extract_caption(rest, "prefix")
+            if rest.strip() != "":
+                text_minichunks = self.chunk_rest(rest)
+                final_chunks.extend(text_minichunks)
+                table_caption_prefix = self.extract_caption(text_minichunks[-1])
+            else:
+                table_caption_prefix = ""
 
-        final_final_chunks = [chunk for chunk, chunk_size in merge_chunks_serially(final_chunks, self._chunk_size)]
+        final_final_chunks = [
+            chunk
+            for chunk, chunk_size in merge_chunks_serially(
+                final_chunks, self._chunk_size
+            )
+        ]
 
         return final_final_chunks
-
-
 
     def chunk_rest(self, item):
         separator = self._separators[-1]
@@ -150,47 +186,62 @@ class PdfTextSplitter(TextSplitter):
             merged_text = self._merge_splits(_good_splits, separator)
             chunks.extend(merged_text)
         return chunks
-        
+
     def chunk_table(self, table, caption):
-        if self._length_function("\n".join([caption, table])) < self._chunk_size - self._noise:
+        if (
+            self._length_function("\n".join([caption, table]))
+            < self._chunk_size - self._noise
+        ):
             return ["\n".join([caption, table])]
         else:
             headers = ""
             if re.search("<th.*>.*</th>", table):
-                headers += re.search("<th.*>.*</th>", table).group() # extract the header out. Opening tag may contain rowspan/colspan
-            splits = table.split(self._table_tags["row_open"]) #split by row tag
+                headers += re.search(
+                    "<th.*>.*</th>", table
+                ).group()  # extract the header out. Opening tag may contain rowspan/colspan
+            splits = table.split(self._table_tags["row_open"])  # split by row tag
             tables = []
-            current_table = caption
+            current_table = caption + "\n"
             for part in splits:
-                if len(part)>0:
-                    if self._length_function(current_table + self._table_tags["row_open"] + part) < self._chunk_size: # if current table length is within permissible limit, keep adding rows
-                        if part not in [self._table_tags["table_open"], self._table_tags["table_close"]]: # need add the separator (row tag) when the part is not a table tag
+                if len(part) > 0:
+                    if (
+                        self._length_function(
+                            current_table + self._table_tags["row_open"] + part
+                        )
+                        < self._chunk_size
+                    ):  # if current table length is within permissible limit, keep adding rows
+                        if part not in [
+                            self._table_tags["table_open"],
+                            self._table_tags["table_close"],
+                        ]:  # need add the separator (row tag) when the part is not a table tag
                             current_table += self._table_tags["row_open"]
                         current_table += part
-                        
+
                     else:
-                        
                         # if current table size is beyond the permissible limit, complete this as a mini-table and add to final mini-tables list
                         current_table += self._table_tags["table_close"]
                         tables.append(current_table)
 
                         # start a new table
-                        current_table = "\n".join([caption, self._table_tags["table_open"], headers])
-                        if part not in [self._table_tags["table_open"], self._table_tags["table_close"]]:
+                        current_table = "\n".join(
+                            [caption, self._table_tags["table_open"], headers]
+                        )
+                        if part not in [
+                            self._table_tags["table_open"],
+                            self._table_tags["table_close"],
+                        ]:
                             current_table += self._table_tags["row_open"]
                         current_table += part
 
-            
             # TO DO: fix the case where the last mini table only contain tags
-            
+
             if not current_table.endswith(self._table_tags["table_close"]):
-                
                 tables.append(current_table + self._table_tags["table_close"])
             else:
                 tables.append(current_table)
             return tables
 
-    
+
 @dataclass
 class Document(object):
     """A data class for storing documents
@@ -201,7 +252,7 @@ class Document(object):
         title (Optional[str]): The title of the document.
         filepath (Optional[str]): The filepath of the document.
         url (Optional[str]): The url of the document.
-        metadata (Optional[Dict]): The metadata of the document.    
+        metadata (Optional[Dict]): The metadata of the document.
     """
 
     content: str
@@ -211,6 +262,7 @@ class Document(object):
     url: Optional[str] = None
     metadata: Optional[Dict] = None
     contentVector: Optional[List[float]] = None
+
 
 def cleanup_content(content: str) -> str:
     """Cleans up the given content using regexes
@@ -224,6 +276,7 @@ def cleanup_content(content: str) -> str:
     output = re.sub(r"-{2,}", "--", output)
 
     return output.strip()
+
 
 class BaseParser(ABC):
     """A parser parses content to produce a document."""
@@ -263,6 +316,7 @@ class BaseParser(ABC):
                 documents.append(self.parse_file(file_path))
         return documents
 
+
 class MarkdownParser(BaseParser):
     """Parses Markdown content."""
 
@@ -278,13 +332,16 @@ class MarkdownParser(BaseParser):
         Returns:
             Document: The parsed document.
         """
-        html_content = markdown.markdown(content, extensions=['fenced_code', 'toc', 'tables', 'sane_lists'])
+        html_content = markdown.markdown(
+            content, extensions=["fenced_code", "toc", "tables", "sane_lists"]
+        )
 
         return self._html_parser.parse(html_content, file_name)
 
 
 class HTMLParser(BaseParser):
     """Parses HTML content."""
+
     TITLE_MAX_TOKENS = 128
     NEWLINE_TEMPL = "<NEWLINE_TEXT>"
 
@@ -300,26 +357,28 @@ class HTMLParser(BaseParser):
         Returns:
             Document: The parsed document.
         """
-        soup = BeautifulSoup(content, 'html.parser')
+        soup = BeautifulSoup(content, "html.parser")
 
         # Extract the title
-        title = ''
+        title = ""
         if soup.title and soup.title.string:
             title = soup.title.string
         else:
             # Try to find the first <h1> tag
-            h1_tag = soup.find('h1')
+            h1_tag = soup.find("h1")
             if h1_tag:
                 title = h1_tag.get_text(strip=True)
             else:
-                h2_tag = soup.find('h2')
+                h2_tag = soup.find("h2")
                 if h2_tag:
                     title = h2_tag.get_text(strip=True)
-        if title is None or title == '':
+        if title is None or title == "":
             # if title is still not found, guess using the next string
             try:
                 title = next(soup.stripped_strings)
-                title = self.token_estimator.construct_tokens_with_size(title, self.TITLE_MAX_TOKENS)
+                title = self.token_estimator.construct_tokens_with_size(
+                    title, self.TITLE_MAX_TOKENS
+                )
 
             except StopIteration:
                 title = file_name
@@ -329,9 +388,10 @@ class HTMLParser(BaseParser):
         # Parse the content as it is without any formatting changes
         result = content
         if title is None:
-            title = '' # ensure no 'None' type title
+            title = ""  # ensure no 'None' type title
 
         return Document(content=cleanup_content(result), title=str(title))
+
 
 class TextParser(BaseParser):
     """Parses text content."""
@@ -396,13 +456,14 @@ class PythonParser(BaseParser):
     def __init__(self) -> None:
         super().__init__()
 
+
 class ParserFactory:
     def __init__(self):
         self._parsers = {
             "html": HTMLParser(),
             "text": TextParser(),
             "markdown": MarkdownParser(),
-            "python": PythonParser()
+            "python": PythonParser(),
         }
 
     @property
@@ -417,12 +478,15 @@ class ParserFactory:
 
         return parser
 
+
 parser_factory = ParserFactory()
+
 
 class UnsupportedFormatError(Exception):
     """Exception raised when a format is not supported by a parser."""
 
     pass
+
 
 @dataclass
 class ChunkingResult:
@@ -435,12 +499,46 @@ class ChunkingResult:
         num_files_with_errors (int): Number of files with errors.
         skipped_chunks (int): Number of chunks skipped.
     """
+
     chunks: List[Document]
     total_files: int
     num_unsupported_format_files: int = 0
     num_files_with_errors: int = 0
     # some chunks might be skipped to small number of tokens
     skipped_chunks: int = 0
+
+
+def extractStorageDetailsFromUrl(url):
+    matches = re.fullmatch(
+        r"https:\/\/([^\/.]*)\.blob\.core\.windows\.net\/([^\/]*)\/(.*)", url
+    )
+    if not matches:
+        raise Exception(f"Not a valid blob storage URL: {url}")
+    return (matches.group(1), matches.group(2), matches.group(3))
+
+
+def downloadBlobUrlToLocalFolder(blob_url, local_folder, credential):
+    (storage_account, container_name, path) = extractStorageDetailsFromUrl(blob_url)
+    container_url = f"https://{storage_account}.blob.core.windows.net/{container_name}"
+    container_client = ContainerClient.from_container_url(
+        container_url, credential=credential
+    )
+    if path and not path.endswith("/"):
+        path = path + "/"
+
+    last_destination_folder = None
+    for blob in container_client.list_blobs(name_starts_with=path):
+        relative_path = blob.name[len(path) :]
+        destination_path = os.path.join(local_folder, relative_path)
+        destination_folder = os.path.dirname(destination_path)
+        if destination_folder != last_destination_folder:
+            os.makedirs(destination_folder, exist_ok=True)
+            last_destination_folder = destination_folder
+        blob_client = container_client.get_blob_client(blob.name)
+        with open(file=destination_path, mode="wb") as local_file:
+            stream = blob_client.download_blob()
+            local_file.write(stream.readall())
+
 
 def get_files_recursively(directory_path: str) -> List[str]:
     """Gets all files in the given directory recursively.
@@ -456,10 +554,12 @@ def get_files_recursively(directory_path: str) -> List[str]:
             file_paths.append(file_path)
     return file_paths
 
+
 def convert_escaped_to_posix(escaped_path):
     windows_path = escaped_path.replace("\\\\", "\\")
     posix_path = windows_path.replace("\\", "/")
     return posix_path
+
 
 def _get_file_format(file_name: str, extensions_to_process: List[str]) -> Optional[str]:
     """Gets the file format from the file name.
@@ -478,52 +578,70 @@ def _get_file_format(file_name: str, extensions_to_process: List[str]) -> Option
         return None
     return FILE_FORMAT_DICT.get(file_extension, None)
 
+
 def table_to_html(table):
     table_html = "<table>"
-    rows = [sorted([cell for cell in table.cells if cell.row_index == i], key=lambda cell: cell.column_index) for i in range(table.row_count)]
+    rows = [
+        sorted(
+            [cell for cell in table.cells if cell.row_index == i],
+            key=lambda cell: cell.column_index,
+        )
+        for i in range(table.row_count)
+    ]
     for row_cells in rows:
         table_html += "<tr>"
         for cell in row_cells:
-            tag = "th" if (cell.kind == "columnHeader" or cell.kind == "rowHeader") else "td"
+            tag = (
+                "th"
+                if (cell.kind == "columnHeader" or cell.kind == "rowHeader")
+                else "td"
+            )
             cell_spans = ""
-            if cell.column_span > 1: cell_spans += f" colSpan={cell.column_span}"
-            if cell.row_span > 1: cell_spans += f" rowSpan={cell.row_span}"
+            if cell.column_span > 1:
+                cell_spans += f" colSpan={cell.column_span}"
+            if cell.row_span > 1:
+                cell_spans += f" rowSpan={cell.row_span}"
             table_html += f"<{tag}{cell_spans}>{html.escape(cell.content)}</{tag}>"
-        table_html +="</tr>"
+        table_html += "</tr>"
     table_html += "</table>"
     return table_html
 
-def extract_pdf_content(file_path, form_recognizer_client, use_layout=False): 
+
+def extract_pdf_content(file_path, form_recognizer_client, use_layout=False):
     offset = 0
     page_map = []
     model = "prebuilt-layout" if use_layout else "prebuilt-read"
     with open(file_path, "rb") as f:
-        poller = form_recognizer_client.begin_analyze_document(model, document = f)
+        poller = form_recognizer_client.begin_analyze_document(model, document=f)
     form_recognizer_results = poller.result()
 
     # (if using layout) mark all the positions of headers
     roles_start = {}
     roles_end = {}
     for paragraph in form_recognizer_results.paragraphs:
-        if paragraph.role!=None:
+        if paragraph.role != None:
             para_start = paragraph.spans[0].offset
             para_end = paragraph.spans[0].offset + paragraph.spans[0].length
             roles_start[para_start] = paragraph.role
             roles_end[para_end] = paragraph.role
 
     for page_num, page in enumerate(form_recognizer_results.pages):
-        tables_on_page = [table for table in form_recognizer_results.tables if table.bounding_regions[0].page_number == page_num + 1]
+        tables_on_page = [
+            table
+            for table in form_recognizer_results.tables
+            if table.bounding_regions[0].page_number == page_num + 1
+        ]
 
         # (if using layout) mark all positions of the table spans in the page
         page_offset = page.spans[0].offset
         page_length = page.spans[0].length
-        table_chars = [-1]*page_length
+        table_chars = [-1] * page_length
         for table_id, table in enumerate(tables_on_page):
             for span in table.spans:
                 # replace all table spans with "table_id" in table_chars array
                 for i in range(span.length):
                     idx = span.offset - page_offset + i
-                    if idx >=0 and idx < page_length:
+                    if idx >= 0 and idx < page_length:
                         table_chars[idx] = table_id
 
         # build page text by replacing charcters in table spans with table html and replace the characters corresponding to headers with html headers, if using layout
@@ -542,7 +660,7 @@ def extract_pdf_content(file_path, form_recognizer_client, use_layout=False):
                         page_text += f"</{PDF_HEADERS[role]}>"
 
                 page_text += form_recognizer_results.content[page_offset + idx]
-                
+
             elif not table_id in added_tables:
                 page_text += table_to_html(tables_on_page[table_id])
                 added_tables.add(table_id)
@@ -554,7 +672,10 @@ def extract_pdf_content(file_path, form_recognizer_client, use_layout=False):
     full_text = "".join([page_text for _, _, page_text in page_map])
     return full_text
 
-def merge_chunks_serially(chunked_content_list: List[str], num_tokens: int) -> Generator[Tuple[str, int], None, None]:
+
+def merge_chunks_serially(
+    chunked_content_list: List[str], num_tokens: int
+) -> Generator[Tuple[str, int], None, None]:
     # TODO: solve for token overlap
     current_chunk = ""
     total_size = 0
@@ -572,44 +693,64 @@ def merge_chunks_serially(chunked_content_list: List[str], num_tokens: int) -> G
         yield current_chunk, total_size
 
 
-def get_embedding(text, embedding_model_endpoint=None, embedding_model_key=None, azure_credential=None):
-    endpoint = embedding_model_endpoint if embedding_model_endpoint else os.environ.get("EMBEDDING_MODEL_ENDPOINT")
-    key = embedding_model_key if embedding_model_key else os.environ.get("EMBEDDING_MODEL_KEY")
-    
+def get_embedding(
+    text, embedding_model_endpoint=None, embedding_model_key=None, azure_credential=None
+):
+    endpoint = (
+        embedding_model_endpoint
+        if embedding_model_endpoint
+        else os.environ.get("EMBEDDING_MODEL_ENDPOINT")
+    )
+    key = (
+        embedding_model_key
+        if embedding_model_key
+        else os.environ.get("EMBEDDING_MODEL_KEY")
+    )
+
     if azure_credential is None and (endpoint is None or key is None):
-        raise Exception("EMBEDDING_MODEL_ENDPOINT and EMBEDDING_MODEL_KEY are required for embedding")
+        raise Exception(
+            "EMBEDDING_MODEL_ENDPOINT and EMBEDDING_MODEL_KEY are required for embedding"
+        )
 
     try:
         endpoint_parts = endpoint.split("/openai/deployments/")
         base_url = endpoint_parts[0]
         deployment_id = endpoint_parts[1].split("/embeddings")[0]
 
-        openai.api_version = '2023-05-15'
+        openai.api_version = "2023-05-15"
         openai.api_base = base_url
 
         if azure_credential is not None:
-            openai.api_key = azure_credential.get_token("https://cognitiveservices.azure.com/.default").token
+            openai.api_key = azure_credential.get_token(
+                "https://cognitiveservices.azure.com/.default"
+            ).token
             openai.api_type = "azure_ad"
         else:
-            openai.api_type = 'azure'
+            openai.api_type = "azure"
             openai.api_key = key
 
         embeddings = openai.Embedding.create(deployment_id=deployment_id, input=text)
-        return embeddings['data'][0]["embedding"]
+        return embeddings["data"][0]["embedding"]
 
     except Exception as e:
-        raise Exception(f"Error getting embeddings with endpoint={endpoint} with error={e}")
+        raise Exception(
+            f"Error getting embeddings with endpoint={endpoint} with error={e}"
+        )
 
 
 def chunk_content_helper(
-        content: str, file_format: str, file_name: Optional[str],
-        token_overlap: int,
-        num_tokens: int = 256
+    content: str,
+    file_format: str,
+    file_name: Optional[str],
+    token_overlap: int,
+    num_tokens: int = 256,
 ) -> Generator[Tuple[str, int, Document], None, None]:
     if num_tokens is None:
         num_tokens = 1000000000
 
-    parser = parser_factory(file_format.split("_pdf")[0]) # to handle cracked pdf converted to html
+    parser = parser_factory(
+        file_format.split("_pdf")[0]
+    )  # to handle cracked pdf converted to html
     doc = parser.parse(content, file_name=file_name)
     # if the original doc after parsing is < num_tokens return as it is
     doc_content_size = TOKEN_ESTIMATOR.estimate_tokens(doc.content)
@@ -618,28 +759,40 @@ def chunk_content_helper(
     else:
         if file_format == "markdown":
             splitter = MarkdownTextSplitter.from_tiktoken_encoder(
-                chunk_size=num_tokens, chunk_overlap=token_overlap)
+                chunk_size=num_tokens, chunk_overlap=token_overlap
+            )
             chunked_content_list = splitter.split_text(
-                content)  # chunk the original content
-            for chunked_content, chunk_size in merge_chunks_serially(chunked_content_list, num_tokens):
+                content
+            )  # chunk the original content
+            for chunked_content, chunk_size in merge_chunks_serially(
+                chunked_content_list, num_tokens
+            ):
                 chunk_doc = parser.parse(chunked_content, file_name=file_name)
                 chunk_doc.title = doc.title
                 yield chunk_doc.content, chunk_size, chunk_doc
         else:
             if file_format == "python":
                 splitter = PythonCodeTextSplitter.from_tiktoken_encoder(
-                    chunk_size=num_tokens, chunk_overlap=token_overlap)
+                    chunk_size=num_tokens, chunk_overlap=token_overlap
+                )
             else:
-                if file_format == "html_pdf": # cracked pdf converted to html
-                    splitter = PdfTextSplitter(separator=SENTENCE_ENDINGS + WORDS_BREAKS, chunk_size=num_tokens, chunk_overlap=token_overlap)
+                if file_format == "html_pdf":  # cracked pdf converted to html
+                    splitter = PdfTextSplitter(
+                        separator=SENTENCE_ENDINGS + WORDS_BREAKS,
+                        chunk_size=num_tokens,
+                        chunk_overlap=token_overlap,
+                    )
                 else:
                     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-                            separators=SENTENCE_ENDINGS + WORDS_BREAKS,
-                            chunk_size=num_tokens, chunk_overlap=token_overlap)
+                        separators=SENTENCE_ENDINGS + WORDS_BREAKS,
+                        chunk_size=num_tokens,
+                        chunk_overlap=token_overlap,
+                    )
             chunked_content_list = splitter.split_text(doc.content)
             for chunked_content in chunked_content_list:
                 chunk_size = TOKEN_ESTIMATOR.estimate_tokens(chunked_content)
                 yield chunked_content, chunk_size, doc
+
 
 def chunk_content(
     content: str,
@@ -649,12 +802,12 @@ def chunk_content(
     num_tokens: int = 256,
     min_chunk_size: int = 10,
     token_overlap: int = 0,
-    extensions_to_process = FILE_FORMAT_DICT.keys(),
-    cracked_pdf = False,
-    use_layout = False,
-    add_embeddings = False,
-    azure_credential = None,
-    embedding_endpoint = None
+    extensions_to_process=FILE_FORMAT_DICT.keys(),
+    cracked_pdf=False,
+    use_layout=False,
+    add_embeddings=False,
+    azure_credential=None,
+    embedding_endpoint=None,
 ) -> ChunkingResult:
     """Chunks the given content. If ignore_errors is true, returns None
         in case of an error
@@ -674,19 +827,18 @@ def chunk_content(
         if file_name is None or (cracked_pdf and not use_layout):
             file_format = "text"
         elif cracked_pdf:
-            file_format = "html_pdf" # differentiate it from native html
+            file_format = "html_pdf"  # differentiate it from native html
         else:
             file_format = _get_file_format(file_name, extensions_to_process)
             if file_format is None:
-                raise Exception(
-                    f"{file_name} is not supported")
+                raise Exception(f"{file_name} is not supported")
 
         chunked_context = chunk_content_helper(
             content=content,
             file_name=file_name,
             file_format=file_format,
             num_tokens=num_tokens,
-            token_overlap=token_overlap
+            token_overlap=token_overlap,
         )
         chunks = []
         skipped_chunks = 0
@@ -695,20 +847,23 @@ def chunk_content(
                 if add_embeddings:
                     for _ in range(RETRY_COUNT):
                         try:
-                            doc.contentVector = get_embedding(chunk, azure_credential=azure_credential, embedding_model_endpoint=embedding_endpoint)
+                            doc.contentVector = get_embedding(
+                                chunk,
+                                azure_credential=azure_credential,
+                                embedding_model_endpoint=embedding_endpoint,
+                            )
                             break
                         except:
-                            sleep(30)
+                            time.sleep(30)
                     if doc.contentVector is None:
                         raise Exception(f"Error getting embedding for chunk={chunk}")
-                    
 
                 chunks.append(
                     Document(
                         content=chunk,
                         title=doc.title,
                         url=url,
-                        contentVector=doc.contentVector
+                        contentVector=doc.contentVector,
                     )
                 )
             else:
@@ -732,19 +887,20 @@ def chunk_content(
         skipped_chunks=skipped_chunks,
     )
 
+
 def chunk_file(
     file_path: str,
     ignore_errors: bool = True,
     num_tokens=256,
     min_chunk_size=10,
-    url = None,
+    url=None,
     token_overlap: int = 0,
-    extensions_to_process = FILE_FORMAT_DICT.keys(),
-    form_recognizer_client = None,
-    use_layout = False,
+    extensions_to_process=FILE_FORMAT_DICT.keys(),
+    form_recognizer_client=None,
+    use_layout=False,
     add_embeddings=False,
-    azure_credential = None,
-    embedding_endpoint = None
+    azure_credential=None,
+    embedding_endpoint=None,
 ) -> ChunkingResult:
     """Chunks the given file.
     Args:
@@ -765,8 +921,12 @@ def chunk_file(
     cracked_pdf = False
     if file_format == "pdf":
         if form_recognizer_client is None:
-            raise UnsupportedFormatError("form_recognizer_client is required for pdf files")
-        content = extract_pdf_content(file_path, form_recognizer_client, use_layout=use_layout)
+            raise UnsupportedFormatError(
+                "form_recognizer_client is required for pdf files"
+            )
+        content = extract_pdf_content(
+            file_path, form_recognizer_client, use_layout=use_layout
+        )
         cracked_pdf = True
     else:
         try:
@@ -774,11 +934,12 @@ def chunk_file(
                 content = f.read()
         except UnicodeDecodeError:
             from chardet import detect
+
             with open(file_path, "rb") as f:
                 binary_content = f.read()
-                encoding = detect(binary_content).get('encoding', 'utf8')
+                encoding = detect(binary_content).get("encoding", "utf8")
                 content = binary_content.decode(encoding)
-        
+
     return chunk_content(
         content=content,
         file_name=file_name,
@@ -792,26 +953,25 @@ def chunk_file(
         use_layout=use_layout,
         add_embeddings=add_embeddings,
         azure_credential=azure_credential,
-        embedding_endpoint=embedding_endpoint
+        embedding_endpoint=embedding_endpoint,
     )
 
 
 def process_file(
-        file_path: str, # !IMP: Please keep this as the first argument
-        directory_path: str,
-        ignore_errors: bool = True,
-        num_tokens: int = 1024,
-        min_chunk_size: int = 10,
-        url_prefix = None,
-        token_overlap: int = 0,
-        extensions_to_process: List[str] = FILE_FORMAT_DICT.keys(),
-        form_recognizer_client = None,
-        use_layout = False,
-        add_embeddings = False,
-        azure_credential = None,
-        embedding_endpoint = None
-    ):
-
+    file_path: str,  # !IMP: Please keep this as the first argument
+    directory_path: str,
+    ignore_errors: bool = True,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix=None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = FILE_FORMAT_DICT.keys(),
+    form_recognizer_client=None,
+    use_layout=False,
+    add_embeddings=False,
+    azure_credential=None,
+    embedding_endpoint=None,
+):
     if not form_recognizer_client:
         form_recognizer_client = SingletonFormRecognizerClient()
 
@@ -835,7 +995,7 @@ def process_file(
             use_layout=use_layout,
             add_embeddings=add_embeddings,
             azure_credential=azure_credential,
-            embedding_endpoint=embedding_endpoint
+            embedding_endpoint=embedding_endpoint,
         )
         for chunk_idx, chunk_doc in enumerate(result.chunks):
             chunk_doc.filepath = rel_file_path
@@ -846,25 +1006,64 @@ def process_file(
             raise
         print(f"File ({file_path}) failed with ", e)
         is_error = True
-        result =None
+        result = None
     return result, is_error
 
 
+def chunk_blob_container(
+    blob_url: str,
+    credential,
+    ignore_errors: bool = True,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix=None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
+    form_recognizer_client=None,
+    use_layout=False,
+    njobs=4,
+    add_embeddings=False,
+    azure_credential=None,
+    embedding_endpoint=None,
+):
+    with tempfile.TemporaryDirectory() as local_data_folder:
+        print(f"Downloading {blob_url} to local folder")
+        downloadBlobUrlToLocalFolder(blob_url, local_data_folder, credential)
+        print(f"Downloaded.")
+
+        result = chunk_directory(
+            local_data_folder,
+            ignore_errors=ignore_errors,
+            num_tokens=num_tokens,
+            min_chunk_size=min_chunk_size,
+            url_prefix=url_prefix,
+            token_overlap=token_overlap,
+            extensions_to_process=extensions_to_process,
+            form_recognizer_client=form_recognizer_client,
+            use_layout=use_layout,
+            njobs=njobs,
+            add_embeddings=add_embeddings,
+            azure_credential=azure_credential,
+            embedding_endpoint=embedding_endpoint,
+        )
+
+    return result
+
 
 def chunk_directory(
-        directory_path: str,
-        ignore_errors: bool = True,
-        num_tokens: int = 1024,
-        min_chunk_size: int = 10,
-        url_prefix = None,
-        token_overlap: int = 0,
-        extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
-        form_recognizer_client = None,
-        use_layout = False,
-        njobs=4,
-        add_embeddings = False,
-        azure_credential = None,
-        embedding_endpoint = None
+    directory_path: str,
+    ignore_errors: bool = True,
+    num_tokens: int = 1024,
+    min_chunk_size: int = 10,
+    url_prefix=None,
+    token_overlap: int = 0,
+    extensions_to_process: List[str] = list(FILE_FORMAT_DICT.keys()),
+    form_recognizer_client=None,
+    use_layout=False,
+    njobs=4,
+    add_embeddings=False,
+    azure_credential=None,
+    embedding_endpoint=None,
 ):
     """
     Chunks the given directory recursively
@@ -873,11 +1072,11 @@ def chunk_directory(
         ignore_errors (bool): If true, ignores errors and returns None.
         num_tokens (int): The number of tokens to use for chunking.
         min_chunk_size (int): The minimum chunk size.
-        url_prefix (str): The url prefix to use for the files. If None, the url will be None. If not None, the url will be url_prefix + relpath. 
-                            For example, if the directory path is /home/user/data and the url_prefix is https://example.com/data, 
+        url_prefix (str): The url prefix to use for the files. If None, the url will be None. If not None, the url will be url_prefix + relpath.
+                            For example, if the directory path is /home/user/data and the url_prefix is https://example.com/data,
                             then the url for the file /home/user/data/file1.txt will be https://example.com/data/file1.txt
         token_overlap (int): The number of tokens to overlap between chunks.
-        extensions_to_process (List[str]): The list of extensions to process. 
+        extensions_to_process (List[str]): The list of extensions to process.
         form_recognizer_client: Optional form recognizer client to use for pdf files.
         use_layout (bool): If true, uses Layout model for pdf files. Otherwise, uses Read.
         add_embeddings (bool): If true, adds a vector embedding to each chunk using the embedding model endpoint and key.
@@ -892,22 +1091,34 @@ def chunk_directory(
     skipped_chunks = 0
 
     all_files_directory = get_files_recursively(directory_path)
-    files_to_process = [file_path for file_path in all_files_directory if os.path.isfile(file_path)]
-    print(f"Total files to process={len(files_to_process)} out of total directory size={len(all_files_directory)}")
+    files_to_process = [
+        file_path for file_path in all_files_directory if os.path.isfile(file_path)
+    ]
+    print(
+        f"Total files to process={len(files_to_process)} out of total directory size={len(all_files_directory)}"
+    )
 
-
-    if njobs==1:
-        print("Single process to chunk and parse the files. --njobs > 1 can help performance.")
-        # for file_path in tqdm(files_to_process):
-        for file_path in files_to_process:
+    if njobs == 1:
+        print(
+            "Single process to chunk and parse the files. --njobs > 1 can help performance."
+        )
+        for file_path in tqdm(files_to_process):
             total_files += 1
-            result, is_error = process_file(file_path=file_path,directory_path=directory_path, ignore_errors=ignore_errors,
-                                       num_tokens=num_tokens,
-                                       min_chunk_size=min_chunk_size, url_prefix=url_prefix,
-                                       token_overlap=token_overlap,
-                                       extensions_to_process=extensions_to_process,
-                                       form_recognizer_client=form_recognizer_client, use_layout=use_layout, add_embeddings=add_embeddings,
-                                       azure_credential=azure_credential, embedding_endpoint=embedding_endpoint)
+            result, is_error = process_file(
+                file_path=file_path,
+                directory_path=directory_path,
+                ignore_errors=ignore_errors,
+                num_tokens=num_tokens,
+                min_chunk_size=min_chunk_size,
+                url_prefix=url_prefix,
+                token_overlap=token_overlap,
+                extensions_to_process=extensions_to_process,
+                form_recognizer_client=form_recognizer_client,
+                use_layout=use_layout,
+                add_embeddings=add_embeddings,
+                azure_credential=azure_credential,
+                embedding_endpoint=embedding_endpoint,
+            )
             if is_error:
                 num_files_with_errors += 1
                 continue
@@ -917,15 +1128,28 @@ def chunk_directory(
             skipped_chunks += result.skipped_chunks
     elif njobs > 1:
         print(f"Multiprocessing with njobs={njobs}")
-        process_file_partial = partial(process_file, directory_path=directory_path, ignore_errors=ignore_errors,
-                                       num_tokens=num_tokens,
-                                       min_chunk_size=min_chunk_size, url_prefix=url_prefix,
-                                       token_overlap=token_overlap,
-                                       extensions_to_process=extensions_to_process,
-                                       form_recognizer_client=None, use_layout=use_layout, add_embeddings=add_embeddings,
-                                       azure_credential=azure_credential, embedding_endpoint=embedding_endpoint)
+        process_file_partial = partial(
+            process_file,
+            directory_path=directory_path,
+            ignore_errors=ignore_errors,
+            num_tokens=num_tokens,
+            min_chunk_size=min_chunk_size,
+            url_prefix=url_prefix,
+            token_overlap=token_overlap,
+            extensions_to_process=extensions_to_process,
+            form_recognizer_client=None,
+            use_layout=use_layout,
+            add_embeddings=add_embeddings,
+            azure_credential=azure_credential,
+            embedding_endpoint=embedding_endpoint,
+        )
         with ProcessPoolExecutor(max_workers=njobs) as executor:
-            futures = list(tqdm(executor.map(process_file_partial, files_to_process), total=len(files_to_process)))
+            futures = list(
+                tqdm(
+                    executor.map(process_file_partial, files_to_process),
+                    total=len(files_to_process),
+                )
+            )
             for result, is_error in futures:
                 total_files += 1
                 if is_error:
@@ -937,27 +1161,33 @@ def chunk_directory(
                 skipped_chunks += result.skipped_chunks
 
     return ChunkingResult(
-            chunks=chunks,
-            total_files=total_files,
-            num_unsupported_format_files=num_unsupported_format_files,
-            num_files_with_errors=num_files_with_errors,
-            skipped_chunks=skipped_chunks,
-        )
+        chunks=chunks,
+        total_files=total_files,
+        num_unsupported_format_files=num_unsupported_format_files,
+        num_files_with_errors=num_files_with_errors,
+        skipped_chunks=skipped_chunks,
+    )
 
 
 class SingletonFormRecognizerClient:
     instance = None
-    url = os.getenv("FORM_RECOGNIZER_ENDPOINT")
-    key = os.getenv("FORM_RECOGNIZER_KEY")
 
     def __new__(cls, *args, **kwargs):
         if not cls.instance:
-            print("SingletonFormRecognizerClient: Creating instance of Form recognizer per process")
-            if cls.url and cls.key:
-                cls.instance = DocumentAnalysisClient(endpoint=cls.url, credential=AzureKeyCredential(cls.key))
+            print(
+                "SingletonFormRecognizerClient: Creating instance of Form recognizer per process"
+            )
+            url = os.getenv("FORM_RECOGNIZER_ENDPOINT")
+            key = os.getenv("FORM_RECOGNIZER_KEY")
+            if url and key:
+                cls.instance = DocumentAnalysisClient(
+                    endpoint=url, credential=AzureKeyCredential(key)
+                )
             else:
-                print("SingletonFormRecognizerClient: Skipping since credentials not provided. Assuming NO form recognizer extensions(like .pdf) in directory")
-                cls.instance = object() # dummy object
+                print(
+                    "SingletonFormRecognizerClient: Skipping since credentials not provided. Assuming NO form recognizer extensions(like .pdf) in directory"
+                )
+                cls.instance = object()  # dummy object
         return cls.instance
 
     def __getstate__(self):
@@ -965,4 +1195,6 @@ class SingletonFormRecognizerClient:
 
     def __setstate__(self, state):
         url, key = state
-        self.instance = DocumentAnalysisClient(endpoint=url, credential=AzureKeyCredential(key))
+        self.instance = DocumentAnalysisClient(
+            endpoint=url, credential=AzureKeyCredential(key)
+        )

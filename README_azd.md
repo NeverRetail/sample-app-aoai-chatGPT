@@ -40,13 +40,13 @@ If you have existing Azure resources that you want to reuse, then you must first
 
 Run the following commands based on what you want to customize:
 
-* `azd env set AZURE_OPENAI_RESOURCE ejfopenainew`
-* `azd env set AZURE_OPENAI_RESOURCE_GROUP {EJFOpenAI}`
-* `azd env set AZURE_OPENAI_SKU_NAME S0`. Defaults to 'S0'.
-* `azd env set AZURE_SEARCH_SERVICE cognostandard`
-* `azd env set AZURE_SEARCH_SERVICE_RESOURCE_GROUP EJFOpenAI`
-* `azd env set AZURE_SEARCH_SKU_NAME standard`. Defaults to 'standard'.
-* `azd env set AZURE_FORMRECOGNIZER_SERVICE {azName of existing Form Recognizer service}`. Used by prepdocs.py for text extraction from docs.
+* `azd env set AZURE_OPENAI_RESOURCE {Name of existing OpenAI service}`
+* `azd env set AZURE_OPENAI_RESOURCE_GROUP {Name of existing resource group that OpenAI service is provisioned to}`
+* `azd env set AZURE_OPENAI_SKU_NAME {Name of OpenAI SKU}`. Defaults to 'S0'.
+* `azd env set AZURE_SEARCH_SERVICE {Name of existing Cognitive Search service}`
+* `azd env set AZURE_SEARCH_SERVICE_RESOURCE_GROUP {Name of existing resource group that Cognitive Search service is provisioned to}`
+* `azd env set AZURE_SEARCH_SKU_NAME {Name of Cognitive Search SKY}`. Defaults to 'standard'.
+* `azd env set AZURE_FORMRECOGNIZER_SERVICE {Name of existing Form Recognizer service}`. Used by prepdocs.py for text extraction from docs.
 * `azd env set AZURE_FORMRECOGNIZER_SERVICE_RESOURCE_GROUP {Name of existing resource group that Form Recognizer service is provisioned to}`.
 * `azd env set AZURE_FORMRECOGNIZER_SKU_NAME {Name of Form Recognizer SKU}`. Defaults to 'S0'.
 
