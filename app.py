@@ -68,7 +68,7 @@ AZURE_OPENAI_SYSTEM_MESSAGE = os.environ.get(
     "You are an AI assistant that helps people find information.",
 )
 AZURE_OPENAI_PREVIEW_API_VERSION = os.environ.get(
-    "AZURE_OPENAI_PREVIEW_API_VERSION", "2023-06-01-preview"
+    "AZURE_OPENAI_PREVIEW_API_VERSION", "2023-08-01-preview"
 )
 AZURE_OPENAI_STREAM = os.environ.get("AZURE_OPENAI_STREAM", "true")
 AZURE_OPENAI_MODEL_NAME = os.environ.get(
